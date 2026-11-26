@@ -1,6 +1,7 @@
 //! Local-only Web console. Blocking TenSunS client stays outside async runtime.
 use base64::{Engine as _,engine::general_purpose::STANDARD as B64};
 use crate::workspace::{self,Profiles,Task};
+use crate::snapshots::{self,Ref as SnapshotRef};
 use crate::{api::Api, formats::{self,Format}, model::Instance, operations::{self,Status}};
 use anyhow::{ensure,Context,Result};
 use axum::{Router,Json,body::Body,extract::{State,DefaultBodyLimit},http::{HeaderMap,HeaderValue,Request,StatusCode,header},middleware::{self,Next},response::{Html,IntoResponse,Response},routing::{get,post}};
@@ -23,7 +24,7 @@ fn upstream(e:anyhow::Error)->WebError{WebError(StatusCode::BAD_GATEWAY,format!(
 fn internal(e:impl std::fmt::Display)->WebError{eprintln!("[WEB] local error: {e}");WebError(StatusCode::INTERNAL_SERVER_ERROR,"本地处理失败，请检查服务端及报告目录".into())}
 fn conflict(message:impl Into<String>)->WebError{WebError(StatusCode::CONFLICT,message.into())}
 fn ok(v:Value)->Response{Json(v).into_response()}
-struct Preview{ticket:String,rows:Vec<Instance>,signature:Vec<(Status,Vec<String>)>,created:Instant}
+struct Preview{ticket:String,rows:Vec<Instance>,signature:Vec<(Status,Vec<String>)>,created:Instant,source:Option<SnapshotRef>}
 struct Session{
     key:String,api:Api,started:Instant,preview:Option<Preview>,
     profile_id:String,
@@ -44,12 +45,25 @@ enum Action{
     Apply{ticket:String,confirm:bool,#[serde(default)]skip_conflicts:bool},
     Export{format:String,#[serde(default)]services:Vec<String>},
     Template,
+    SnapshotCreate{label:String,#[serde(default)]services:Vec<String>},
+    Snapshots,
+    SnapshotDownload{source:SnapshotRef},
+    Compare{source:SnapshotRef,#[serde(default)]target:Option<SnapshotRef>,#[serde(default)]services:Vec<String>},
+    SyncPreview{source:SnapshotRef,#[serde(default)]services:Vec<String>},
     Reports,
     Report{id:String},
 }
 fn fmt(s:&str)->std::result::Result<Format,WebError>{match s{"txt"=>Ok(Format::Txt),"csv"=>Ok(Format::Csv),"json"=>Ok(Format::Json),"jsonl"=>Ok(Format::Jsonl),"xlsx"=>Ok(Format::Xlsx),_=>Err(bad("不支持的文件格式"))}}
 fn signature(rows:&[Instance],old:&[Instance])->Vec<(Status,Vec<String>)>{
     operations::plan(rows,old).into_iter().map(|(_,s,g)|(s,g)).collect()
+}
+fn preview_rows(s:&mut Session,rows:Vec<Instance>,old:&[Instance],source:Option<SnapshotRef>)->WebResult{
+    if rows.is_empty()||rows.len()>MAX_ROWS{return Err(bad("单批必须为 1 至 10000 条实例"));}
+    let sig=signature(&rows,old);let mut counts=BTreeMap::<&str,usize>::new();
+    let entries=rows.iter().zip(&sig).map(|(row,(status,groups))|{*counts.entry(status.as_str()).or_default()+=1;json!({"instance":row,"status":status.as_str(),"existing_groups":groups})}).collect::<Vec<_>>();
+    let ticket=Uuid::new_v4().to_string();
+    s.preview=Some(Preview{ticket:ticket.clone(),rows,signature:sig,created:Instant::now(),source:source.clone()});
+    Ok(ok(json!({"ticket":ticket,"counts":counts,"entries":entries,"expires_in":600,"source":source})))
 }
 fn catalog(api:&Api)->Result<Vec<Instance>>{operations::snapshot(api,&api.groups()?)}
 fn report_path(dir:&Path,id:&str)->PathBuf{dir.join(format!("import-{id}.jsonl"))}
@@ -141,15 +155,7 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
             let rows=if format=="xlsx"{let bytes=B64.decode(&content).map_err(|_|bad("无效 XLSX 数据"))?;crate::excel::read(&bytes)}else{formats::read_from(Cursor::new(content.as_bytes()),fmt(&format)?)}.map_err(|e|bad(format!("{e:#}")))?;
             if rows.len()>MAX_ROWS{return Err(bad("单批最多 10000 条实例"));}
             let old=catalog(&s.api).map_err(upstream)?;
-            let sig=signature(&rows,&old);
-            let mut counts=BTreeMap::<&str,usize>::new();
-            let entries=rows.iter().zip(&sig).map(|(row,(status,groups))|{
-                *counts.entry(status.as_str()).or_default()+=1;
-                json!({"instance":row,"status":status.as_str(),"existing_groups":groups})
-            }).collect::<Vec<_>>();
-            let ticket=Uuid::new_v4().to_string();
-            s.preview=Some(Preview{ticket:ticket.clone(),rows,signature:sig,created:Instant::now()});
-            Ok(ok(json!({"ticket":ticket,"counts":counts,"entries":entries,"expires_in":600})))
+            preview_rows(s,rows,&old,None)
         },
         Action::Apply{ticket,confirm,skip_conflicts}=>{
             if !confirm{return Err(bad("必须明确确认执行"));}
@@ -160,7 +166,7 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
             if !skip_conflicts&&p.signature.iter().any(|(status,_)|*status==Status::Conflict){return Err(conflict("存在冲突，未写入；请重新预览或显式跳过冲突"));}
             let id=Uuid::new_v4().to_string();
             let path=report_path(&dir,&id);
-            let mut task=Task::new(id.clone());task.save(&dir).map_err(internal)?;
+            let mut task=Task::new(id.clone());task.source=p.source.clone();task.save(&dir).map_err(internal)?;
             *state.progress.lock().map_err(internal)?=Some((key.into(),path.clone(),id.clone()));
             // Shared CLI implementation persists intent and stops on uncertain writes.
             let result=operations::execute(&s.api,&p.rows,&old,true,skip_conflicts,Some(path.clone()));
@@ -186,6 +192,45 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
             formats::write_to(&mut bytes,f,&rows).map_err(|e|bad(format!("{e:#}")))?;
             let (text,encoding)=if format=="xlsx"{(B64.encode(bytes),"base64")}else{(String::from_utf8(bytes).map_err(internal)?,"utf8")};
             Ok(ok(json!({"filename":format!("tensuns-instances.{format}"),"content":text,"encoding":encoding,"count":rows.len()})))
+        },
+        Action::SnapshotCreate{label,services}=>{
+            let profile=state.profiles.lock().map_err(internal)?.get(Some(&s.profile_id)).map_err(internal)?;
+            let all_groups=services.is_empty();let selected=operations::select_groups(&s.api,&services).map_err(upstream)?;
+            let rows=operations::snapshot(&s.api,&selected).map_err(upstream)?;
+            let meta=snapshots::save(&dir,&profile,&label,selected,all_groups,rows).map_err(|e|bad(format!("{e:#}")))?;
+            Ok(ok(json!({"snapshot":meta})))
+        },
+        Action::Snapshots=>{
+            let profiles=state.profiles.lock().map_err(internal)?.items.clone();
+            Ok(ok(json!({"snapshots":snapshots::list(&state.report_dir,&profiles).map_err(internal)?})))
+        },
+        Action::SnapshotDownload{source}=>{
+            let profiles=state.profiles.lock().map_err(internal)?.items.clone();
+            let snap=snapshots::load(&state.report_dir,&profiles,&source).map_err(|e|bad(format!("{e:#}")))?;
+            let content=serde_json::to_string_pretty(&snap.rows).map_err(internal)?;
+            Ok(ok(json!({"filename":format!("snapshot-{}.json",snap.meta.id),"content":content,"count":snap.rows.len()})))
+        },
+        Action::Compare{source,target,services}=>{
+            let profiles=state.profiles.lock().map_err(internal)?.items.clone();
+            let source=snapshots::load(&state.report_dir,&profiles,&source).map_err(|e|bad(format!("{e:#}")))?;
+            let (wanted,scope)=snapshots::select(&source,&services).map_err(|e|bad(format!("{e:#}")))?;
+            let old=if let Some(reference)=target{
+                let target=snapshots::load(&state.report_dir,&profiles,&reference).map_err(|e|bad(format!("{e:#}")))?;
+                if !target.meta.all_groups{return Err(bad("历史比较的目标必须是全量快照，以检测跨服务组 ID 冲突"));}
+                target.rows
+            }else{catalog(&s.api).map_err(upstream)?};
+            let result=snapshots::compare(&wanted,&old,scope.as_ref());
+            Ok(ok(serde_json::to_value(result).map_err(internal)?))
+        },
+        Action::SyncPreview{source,services}=>{
+            s.preview=None;
+            let profiles=state.profiles.lock().map_err(internal)?.items.clone();
+            let snap=snapshots::load(&state.report_dir,&profiles,&source).map_err(|e|bad(format!("{e:#}")))?;
+            let (wanted,_)=snapshots::select(&snap,&services).map_err(|e|bad(format!("{e:#}")))?;
+            let rows=formats::validate_rows(wanted).map_err(|e|bad(format!("{e:#}")))?;
+            if rows.len()>MAX_ROWS{return Err(bad("同步单批最多 10000 条，请按服务组拆分"));}
+            let old=catalog(&s.api).map_err(upstream)?;
+            preview_rows(s,rows,&old,Some(source))
         },
         Action::Template=>{let row=Instance{id:"switch-01".into(),name:"snmp_exporter".into(),address:"192.0.2.11".into(),port:161,tags:vec![],meta:BTreeMap::new()};let content=B64.encode(crate::excel::write(&[row]).map_err(internal)?);Ok(ok(json!({"filename":"instances.xlsx","content":content,"encoding":"base64"})))},
         Action::Reports=>{

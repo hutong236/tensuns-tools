@@ -8,6 +8,8 @@ binary=pathlib.Path(sys.argv[1]).resolve()
 def row(i,g='bulk'):return dict(ID=i,name=g,address='192.0.2.1',port=9100,tags=[],meta={})
 state={f'old-{i}':row(f'old-{i}') for i in range(6001)}
 writes=[]
+target_state={'first':dict(row('first','other'),port=161),'extra':row('extra','new')}
+target_writes=[]
 fail_id=None
 class Upstream(BaseHTTPRequestHandler):
  def log_message(self,*a):pass
@@ -16,21 +18,22 @@ class Upstream(BaseHTTPRequestHandler):
  def do_GET(self):
   if self.headers.get('Content-Type'):return self.send({'error':'unexpected Content-Type'},400)
   if self.headers.get('Authorization')!='Bearer mock':return self.send({'code':50000})
-  u=urlparse(self.path)
-  if u.path=='/api/consul/services_name':return self.send({'code':20000,'services_name':sorted({r['name'] for r in state.values()})})
-  if u.path=='/api/consul/instances':
+  u=urlparse(self.path);is_target=u.path.startswith('/target/');catalog=target_state if is_target else state;path=u.path.removeprefix('/target')
+  if path=='/api/consul/services_name':return self.send({'code':20000,'services_name':sorted({r['name'] for r in catalog.values()})})
+  if path=='/api/consul/instances':
    g=parse_qs(u.query)['service_name'][0]
-   return self.send({'code':20000,'instances':[dict(r,tags=r['tags'] or '无',meta=[r['meta']] if r['meta'] else '无') for r in state.values() if r['name']==g]})
+   return self.send({'code':20000,'instances':[dict(r,tags=r['tags'] or '无',meta=[r['meta']] if r['meta'] else '无') for r in catalog.values() if r['name']==g]})
   return self.send({},404)
  def do_POST(self):
   data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-  if self.path=='/api/user/login':
+  is_target=self.path.startswith('/target/');path=self.path.removeprefix('/target');catalog=target_state if is_target else state;submitted=target_writes if is_target else writes
+  if path=='/api/user/login':
    return self.send({'code':20000,'data':{'token':'Bearer mock'}} if data=={'username':'admin','password':'mock password'} else {'code':40000})
-  assert self.path=='/api/consul/sid' and self.headers.get('Authorization')=='Bearer mock'
-  d=data['instance_dict'];writes.append(d['ID'])
+  assert path=='/api/consul/sid' and self.headers.get('Authorization')=='Bearer mock'
+  d=data['instance_dict'];submitted.append(d['ID'])
   if d['ID']==fail_id:return self.send({'code':50000,'data':'mock failure'})
   assert d['checkInfo']['isCheck'] is False
-  state[d['ID']]=dict(ID=d['ID'],name=d['name'],address=d['address'],port=d['port'],tags=d['tags'],meta=json.loads(d['metaInfo']['metaJson']) if d['metaInfo']['isMeta'] else {})
+  catalog[d['ID']]=dict(ID=d['ID'],name=d['name'],address=d['address'],port=d['port'],tags=d['tags'],meta=json.loads(d['metaInfo']['metaJson']) if d['metaInfo']['isMeta'] else {})
   return self.send({'code':20000})
 up=ThreadingHTTPServer(('127.0.0.1',0),Upstream);threading.Thread(target=up.serve_forever,daemon=True).start()
 with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
@@ -81,7 +84,7 @@ with tempfile.TemporaryDirectory() as d:
   for fmt in ['txt','csv','json','jsonl','xlsx']:
    exported=call('export',format=fmt,services=['new']);assert exported['count']==2
    plan=call('preview',format=fmt,content=exported['content']);assert plan['counts']=={'unchanged':2}
-  print('PASS four-format export/import roundtrip',flush=True)
+  print('PASS five-format export/import roundtrip',flush=True)
   plan=call('preview',format='txt',content='new|third|192.0.2.1|9100||\n')
   state['third']=row('third','other');call('apply',409,ticket=plan['ticket'],confirm=True);assert 'third' not in writes
   plan=call('preview',format='txt',content='new|third|192.0.2.1|9100||\nnew|fourth|192.0.2.1|9100||\n');assert plan['counts']=={'conflict':1,'planned':1}
@@ -94,7 +97,28 @@ with tempfile.TemporaryDirectory() as d:
   plan=call('preview',format='txt',content='new|fail|192.0.2.1|9100||\nnew|never|192.0.2.1|9100||\n')
   result=call('apply',ticket=plan['ticket'],confirm=True);assert result['exit_code']==1 and result['counts']=={'failed_or_uncertain':1,'not_attempted':1} and 'never' not in writes
   call('logout');call('groups',401);call('report',401,id=reports[0]['id']);token=call('login',username='admin',password='mock password')['session'];assert len(call('reports')['reports'])>=2;assert 'verified' in call('report',id=reports[0]['id'])['content'];assert call('template')['encoding']=='base64'
-  print('PASS failed write stop and logout',flush=True)
+  print('PASS failed write stop, logout and persistent reports',flush=True)
+  source_profile=json.loads(req('/api/info')[0])['default_id']
+  saved=call('snapshot_create',label='source new group',services=['new'])['snapshot']
+  assert saved['count']==3 and saved['profile_id']==source_profile
+  source={'profile_id':source_profile,'snapshot_id':saved['id']}
+  assert len(json.loads(call('snapshot_download',source=source)['content']))==3
+  full=call('snapshot_create',label='source full',services=[])['snapshot']
+  d1=call('compare',source=source,target={'profile_id':source_profile,'snapshot_id':full['id']},services=[])
+  assert d1['counts']=={'unchanged':3}
+  target=call('add_profile',name='target',url=f'http://127.0.0.1:{up.server_port}/target',username='admin')['profile']
+  call('logout');token=call('login',username='admin',password='mock password',profile_id=target['id'])['session']
+  assert not call('reports')['reports'];assert len(call('snapshots')['snapshots'])==2
+  diff=call('compare',source=source,services=[])
+  assert diff['counts']=={'changed':1,'missing_in_target':2,'target_only':1},diff['counts']
+  assert next(x for x in diff['entries'] if x['ID']=='first')['changed_fields']==['name','port']
+  assert not target_writes
+  plan=call('sync_preview',source=source,services=[]);assert plan['counts']=={'conflict':1,'planned':2}
+  call('apply',409,ticket=plan['ticket'],confirm=True);assert not target_writes
+  plan=call('sync_preview',source=source,services=[])
+  result=call('apply',ticket=plan['ticket'],confirm=True,skip_conflicts=True);assert result['exit_code']==0 and sorted(target_writes)==['fourth','second'] and target_state['first']['name']=='other' and 'extra' in target_state
+  assert call('reports')['reports'][0]['source']==source
+  print('PASS snapshot history, profile isolation, cross-environment diff and additive sync',flush=True)
  finally:
   p.terminate();p.wait(timeout=15)
 up.shutdown()

@@ -45,9 +45,9 @@ pub fn report_counts(report:&str)->BTreeMap<String,usize>{
     let mut counts=BTreeMap::new();for status in latest.values(){*counts.entry(status.clone()).or_insert(0)+=1;}counts
 }
 #[derive(Clone,Serialize,Deserialize)]
-pub struct Task {pub id:String,pub created:u64,pub state:String,pub exit_code:Option<i32>}
+pub struct Task {pub id:String,pub created:u64,pub state:String,pub exit_code:Option<i32>,#[serde(default)]pub source:Option<crate::snapshots::Ref>}
 impl Task{
-    pub fn new(id:String)->Self{Self{id,created:std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),state:"running".into(),exit_code:None}}
+    pub fn new(id:String)->Self{Self{id,created:std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),state:"running".into(),exit_code:None,source:None}}
     pub fn save(&self,dir:&Path)->Result<()>{write_json(&dir.join(format!("task-{}.json",self.id)),self)}
 }
 pub fn tasks(dir:&Path)->Result<Vec<Task>>{

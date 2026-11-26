@@ -53,6 +53,7 @@ with tempfile.TemporaryDirectory() as d:
   run('export',f'out.{ext}','--service','special','--service','new');run('validate',f'out.{ext}');run('import',f'out.{ext}','--report',f'round-{ext}.jsonl');assert set(statuses(f'round-{ext}.jsonl'))=={'unchanged'};print('PASS roundtrip '+ext,flush=True)
  run('export','out.txt','--service','new');run('validate','out.txt');run('export','bad.txt','--service','special',rc=1);assert not pathlib.Path('bad.txt').exists();print('PASS TXT and refusal of lossy export',flush=True)
  run('export','out.txt','--service','new',rc=1);run('export','out.txt','--service','new','--force');print('PASS no-clobber / force',flush=True)
+ assert json.loads(run('diff','new.txt','--changes-only').stdout)['counts']['unchanged']==2;print('PASS CLI diff',flush=True)
  run('export','all.json');assert len(json.loads(pathlib.Path('all.json').read_text(encoding='utf-8')))==len(state);assert 'bulk\t6000' in run('list','--service','bulk').stdout;print('PASS full export / count',flush=True)
  file('dup.txt','x|dupe|192.0.2.1|9100||\ny|dupe|192.0.2.1|9100||\n');run('validate','dup.txt',rc=1);print('PASS duplicate input',flush=True)
  file('fail.txt','x|first|192.0.2.1|9100||\nx|fail|192.0.2.1|9100||\nx|last|192.0.2.1|9100||\n');fail_id='fail';run('import','fail.txt','--apply','--report','fail.jsonl',rc=1);assert 'last' not in writes and {'failed_or_uncertain','verified','not_attempted'}<=set(statuses('fail.jsonl'));print('PASS business failure stops / records',flush=True)
