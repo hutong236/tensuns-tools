@@ -1,0 +1,73 @@
+name: Publish tested v4.2.0
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publish-v4.2.0.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: publish-v4.2.0
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_SHA: bfd4c81c2361b637b32121a2e5d85f22a3e4a17b
+      CI_RUN: '45769517129'
+      TAG: v4.2.0
+    steps:
+      - name: Verify source and wait for its five-platform CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            result=$(gh api "repos/$GH_REPO/actions/runs/$CI_RUN")
+            jq -e --arg sha "$SOURCE_SHA" '.head_sha == $sha and .event == "push" and .head_branch == "main" and .path == ".github/workflows/ci.yml"' <<< "$result" >/dev/null
+            status=$(jq -r '.status' <<< "$result")
+            if [ "$status" = completed ]; then
+              jq -e '.conclusion == "success"' <<< "$result" >/dev/null
+              break
+            fi
+            sleep 15
+          done
+          test "$status" = completed
+          jobs=$(gh api "repos/$GH_REPO/actions/runs/$CI_RUN/jobs?per_page=100")
+          jq -e '[.jobs[] | select(.name | startswith("build ("))] | length == 5 and all(.conclusion == "success")' <<< "$jobs" >/dev/null
+      - name: Check source version
+        shell: bash
+        run: |
+          gh api "repos/$GH_REPO/contents/Cargo.toml?ref=$SOURCE_SHA" --jq .content | base64 -d > Cargo.toml
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          test "$TAG" = "v$version"
+      - name: Download and verify tested packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$CI_RUN" --pattern 'tensuns-*' --dir release-assets
+          mkdir -p verified
+          for platform in linux-amd64 linux-arm64 macos-amd64 macos-arm64 windows-amd64; do
+            ext=tar.gz
+            if [ "$platform" = windows-amd64 ]; then ext=zip; fi
+            name="tensuns-$TAG-$platform.$ext"
+            cp "release-assets/tensuns-$platform/$name" verified/
+            cp "release-assets/tensuns-$platform/$name.sha256" verified/
+          done
+          cd verified
+          sha256sum -c *.sha256
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 10
+      - name: Create immutable version tag and publish Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if existing=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq .object.sha 2>/dev/null); then
+            test "$existing" = "$SOURCE_SHA"
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SOURCE_SHA" >/dev/null
+          fi
+          test "$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq .object.sha)" = "$SOURCE_SHA"
+          gh release create "$TAG" verified/* --verify-tag --generate-notes --title "TenSunS Tools $TAG"
