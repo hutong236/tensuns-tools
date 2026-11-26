@@ -3,6 +3,8 @@ mod formats;
 mod model;
 mod operations;
 mod web;
+mod excel;
+mod workspace;
 use anyhow::Result;
 use clap::{Parser,Subcommand};
 use formats::Format;

@@ -5,17 +5,17 @@ use std::{collections::{BTreeMap, HashSet}, fs::File, io::{BufRead, BufReader, W
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum Format { Txt, Csv, Json, Jsonl }
+pub enum Format { Txt, Csv, Json, Jsonl, Xlsx }
 impl Format {
     pub fn infer(path: &Path, explicit: Option<Self>) -> Result<Self> {
         if let Some(f) = explicit { return Ok(f); }
         match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
-            "txt" => Ok(Self::Txt), "csv" => Ok(Self::Csv), "json" => Ok(Self::Json), "jsonl" => Ok(Self::Jsonl), _ => bail!("use --format txt|csv|json|jsonl"),
+            "txt" => Ok(Self::Txt), "csv" => Ok(Self::Csv), "json" => Ok(Self::Json), "jsonl" => Ok(Self::Jsonl), "xlsx" => Ok(Self::Xlsx), _ => bail!("use --format txt|csv|json|jsonl|xlsx"),
         }
     }
 }
-const HEADER: [&str; 6] = ["ServiceName","InstanceID","IP","Port","Tags","Meta"];
-fn from_fields(f: &[&str], csv: bool) -> Result<Instance> {
+pub(crate) const HEADER: [&str; 6] = ["ServiceName","InstanceID","IP","Port","Tags","Meta"];
+pub(crate) fn from_fields(f: &[&str], csv: bool) -> Result<Instance> {
     ensure!(f.len() == 6, "expected six fields");
     let (tags, meta) = if csv {
         (serde_json::from_str(if f[4].is_empty() { "[]" } else { f[4] })?, serde_json::from_str(if f[5].is_empty() { "{}" } else { f[5] })?)
@@ -31,12 +31,14 @@ fn from_fields(f: &[&str], csv: bool) -> Result<Instance> {
     Ok(Instance { name:f[0].into(), id:f[1].into(), address:f[2].into(), port:if f[3].is_empty(){0}else{f[3].parse()?},tags,meta })
 }
 pub fn read(path: &Path, format: Format) -> Result<Vec<Instance>> {
+    if matches!(format,Format::Xlsx){return crate::excel::read(&std::fs::read(path)?);}
     let file = File::open(path).with_context(|| format!("open {}",path.display()))?;
     read_from(BufReader::new(file),format)
 }
 pub(crate) fn read_from<R: BufRead>(file:R, format:Format)->Result<Vec<Instance>> {
     let mut rows = Vec::new();
     match format {
+        Format::Xlsx => bail!("use binary XLSX parser"),
         Format::Json => { rows = serde_json::from_reader(file)?; }
         Format::Jsonl | Format::Txt => for (i,line) in file.lines().enumerate() {
             let line = line?;
@@ -51,6 +53,9 @@ pub(crate) fn read_from<R: BufRead>(file:R, format:Format)->Result<Vec<Instance>
             for record in rdr.records() { let r=record?; rows.push(from_fields(&r.iter().collect::<Vec<_>>(),true)?); }
         }
     }
+    validate_rows(rows)
+}
+pub(crate) fn validate_rows(mut rows:Vec<Instance>)->Result<Vec<Instance>> {
     ensure!(!rows.is_empty(),"no instances found");
     let mut ids=HashSet::new();
     for r in &mut rows {r.validate()?; r.canonicalize(); ensure!(ids.insert(r.id.clone()),"duplicate input ID: {}",r.id);}
@@ -73,6 +78,7 @@ pub fn write(path: &Path, format: Format, rows: &[Instance], force: bool) -> Res
 }
 pub(crate) fn write_to<W: Write>(mut tmp: W, format:Format, rows:&[Instance])->Result<()> {
     match format {
+        Format::Xlsx => tmp.write_all(&crate::excel::write(rows)?)?,
         Format::Json => {serde_json::to_writer_pretty(&mut tmp,rows)?; writeln!(tmp)?;},
         Format::Jsonl => for r in rows {serde_json::to_writer(&mut tmp,r)?;writeln!(tmp)?;},
         Format::Txt => {writeln!(tmp,"# ServiceName|InstanceID|IP|Port|Tags|Meta")?;for r in rows {writeln!(tmp,"{}",txt_line(r)?)?;}},
@@ -86,6 +92,6 @@ mod tests {
     #[test] fn roundtrip() {
         let t=tempfile::tempdir().unwrap();
         let row:Instance=serde_json::from_str(r#"{"ID":"a/b@c","name":"snmp","address":"10.0.0.1","port":161,"tags":[],"meta":{"v":"hello"}}"#).unwrap();
-        for f in [Format::Txt,Format::Csv,Format::Json,Format::Jsonl] {let p=t.path().join(format!("{f:?}"));write(&p,f,&[row.clone()],false).unwrap();assert_eq!(read(&p,f).unwrap(),vec![row.clone()]);assert!(write(&p,f,&[],false).is_err());}
+        for f in [Format::Txt,Format::Csv,Format::Json,Format::Jsonl,Format::Xlsx] {let p=t.path().join(format!("{f:?}"));write(&p,f,&[row.clone()],false).unwrap();assert_eq!(read(&p,f).unwrap(),vec![row.clone()]);assert!(write(&p,f,&[],false).is_err());}
     }
 }

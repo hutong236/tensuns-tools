@@ -1,4 +1,6 @@
 //! Local-only Web console. Blocking TenSunS client stays outside async runtime.
+use base64::{Engine as _,engine::general_purpose::STANDARD as B64};
+use crate::workspace::{self,Profiles,Task};
 use crate::{api::Api, formats::{self,Format}, model::Instance, operations::{self,Status}};
 use anyhow::{ensure,Context,Result};
 use axum::{Router,Json,body::Body,extract::{State,DefaultBodyLimit},http::{HeaderMap,HeaderValue,Request,StatusCode,header},middleware::{self,Next},response::{Html,IntoResponse,Response},routing::{get,post}};
@@ -24,26 +26,28 @@ fn ok(v:Value)->Response{Json(v).into_response()}
 struct Preview{ticket:String,rows:Vec<Instance>,signature:Vec<(Status,Vec<String>)>,created:Instant}
 struct Session{
     key:String,api:Api,started:Instant,preview:Option<Preview>,
-    reports:BTreeMap<String,i32>,
+    profile_id:String,
 }
 struct Shared{
     authority:String,origin:String,base:String,user:String,timeout:u64,
-    report_dir:PathBuf,session:Mutex<Option<Session>>,gate:Arc<Semaphore>,
+    report_dir:PathBuf,session:Mutex<Option<Session>>,gate:Arc<Semaphore>,profiles:Mutex<Profiles>,progress:Mutex<Option<(String,PathBuf,String)>>,
 }
 #[derive(Deserialize)]
 #[serde(tag="action",rename_all="snake_case",deny_unknown_fields)]
 enum Action{
-    Login{username:String,password:String},
+    Login{username:String,password:String,#[serde(default)]profile_id:Option<String>},
+    AddProfile{name:String,url:String,username:String},
     Logout,
     Groups,
     Instances{#[serde(default)]service:Option<String>,#[serde(default)]query:String,page:usize,page_size:usize},
     Preview{format:String,content:String},
     Apply{ticket:String,confirm:bool,#[serde(default)]skip_conflicts:bool},
     Export{format:String,#[serde(default)]services:Vec<String>},
+    Template,
     Reports,
     Report{id:String},
 }
-fn fmt(s:&str)->std::result::Result<Format,WebError>{match s{"txt"=>Ok(Format::Txt),"csv"=>Ok(Format::Csv),"json"=>Ok(Format::Json),"jsonl"=>Ok(Format::Jsonl),_=>Err(bad("不支持的文件格式"))}}
+fn fmt(s:&str)->std::result::Result<Format,WebError>{match s{"txt"=>Ok(Format::Txt),"csv"=>Ok(Format::Csv),"json"=>Ok(Format::Json),"jsonl"=>Ok(Format::Jsonl),"xlsx"=>Ok(Format::Xlsx),_=>Err(bad("不支持的文件格式"))}}
 fn signature(rows:&[Instance],old:&[Instance])->Vec<(Status,Vec<String>)>{
     operations::plan(rows,old).into_iter().map(|(_,s,g)|(s,g)).collect()
 }
@@ -73,7 +77,16 @@ async fn guard(State(state):State<Arc<Shared>>,request:Request<Body>,next:Next)-
 async fn page()->Html<&'static str>{Html(include_str!("../web/index.html"))}
 async fn js()->impl IntoResponse{([(header::CONTENT_TYPE,"application/javascript; charset=utf-8")],include_str!("../web/app.js"))}
 async fn css()->impl IntoResponse{([(header::CONTENT_TYPE,"text/css; charset=utf-8")],include_str!("../web/style.css"))}
-async fn info(State(s):State<Arc<Shared>>)->Response{ok(json!({"url":s.base,"username":s.user,"version":env!("CARGO_PKG_VERSION")}))}
+async fn info(State(s):State<Arc<Shared>>)->WebResult{
+    let p=s.profiles.lock().map_err(internal)?;
+    Ok(ok(json!({"url":s.base,"username":s.user,"version":env!("CARGO_PKG_VERSION"),"profiles":p.items,"default_id":p.default_id})))
+}
+async fn progress(State(s):State<Arc<Shared>>,headers:HeaderMap)->WebResult{
+    let key=headers.get("x-tensuns-session").and_then(|v|v.to_str().ok()).unwrap_or("");
+    let current=s.progress.lock().map_err(internal)?.clone();
+    if let Some((owner,path,id))=current{if key==owner && !key.is_empty(){let text=std::fs::read_to_string(path).unwrap_or_default();return Ok(ok(json!({"running":true,"id":id,"counts":workspace::report_counts(&text)})));}}
+    Ok(ok(json!({"running":false})))
+}
 async fn action(State(state):State<Arc<Shared>>,headers:HeaderMap,Json(action):Json<Action>)->WebResult{
     let key=headers.get("x-tensuns-session").and_then(|x|x.to_str().ok()).unwrap_or("").to_owned();
     let permit=state.gate.clone().try_acquire_owned().map_err(|_|conflict("已有操作正在执行，请勿重复提交"))?;
@@ -83,21 +96,25 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
     let mut slot=state.session.lock().map_err(internal)?;
     if slot.as_ref().is_some_and(|s|s.started.elapsed()>=Duration::from_secs(3600)){*slot=None;}
     let action=match action{
-        Action::Login{username,password}=>{
+        Action::Login{username,password,profile_id}=>{
             let mut password=zeroize::Zeroizing::new(password);
             if username.trim().is_empty()||password.is_empty()||username.len()>256||password.len()>4096{return Err(bad("用户名或密码无效"));}
-            let api=Api::login_web(&state.base,username.trim(),state.timeout,std::mem::take(&mut *password)).map_err(|_|unauthorized())?;
+            let profile=state.profiles.lock().map_err(internal)?.get(profile_id.as_deref()).map_err(|e|bad(e.to_string()))?;
+            if username.trim()!=profile.username{return Err(bad("用户名需与连接配置一致"));}
+            let api=Api::login_web(&profile.url,username.trim(),state.timeout,std::mem::take(&mut *password)).map_err(|_|unauthorized())?;
             api.groups().map_err(upstream)?;
             let token=Uuid::new_v4().to_string();
-            *slot=Some(Session{key:token.clone(),api,started:Instant::now(),preview:None,reports:BTreeMap::new()});
-            return Ok(ok(json!({"session":token,"expires_in":3600})));
+            *slot=Some(Session{key:token.clone(),api,started:Instant::now(),preview:None,profile_id:profile.id.clone()});
+            return Ok(ok(json!({"session":token,"expires_in":3600,"profile":profile})));
         },
         other=>other,
     };
     if slot.as_ref().is_none_or(|s|key.is_empty()||key!=s.key){return Err(unauthorized());}
     if matches!(&action,Action::Logout){*slot=None;return Ok(ok(json!({"ok":true}))); }
     let s=slot.as_mut().ok_or_else(unauthorized)?;
+    let dir=workspace::profile_dir(&state.report_dir,&s.profile_id).map_err(internal)?;
     match action {
+        Action::AddProfile{name,url,username}=>{let p=state.profiles.lock().map_err(internal)?.add(name,url,username).map_err(|e|bad(e.to_string()))?;Ok(ok(json!({"profile":p})))},
         Action::Groups=>{
             let mut result=Vec::new();
             for name in s.api.groups().map_err(upstream)?{
@@ -121,7 +138,7 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
         },
         Action::Preview{format,content}=>{
             s.preview=None;
-            let rows=formats::read_from(Cursor::new(content.as_bytes()),fmt(&format)?).map_err(|e|bad(format!("{e:#}")))?;
+            let rows=if format=="xlsx"{let bytes=B64.decode(&content).map_err(|_|bad("无效 XLSX 数据"))?;crate::excel::read(&bytes)}else{formats::read_from(Cursor::new(content.as_bytes()),fmt(&format)?)}.map_err(|e|bad(format!("{e:#}")))?;
             if rows.len()>MAX_ROWS{return Err(bad("单批最多 10000 条实例"));}
             let old=catalog(&s.api).map_err(upstream)?;
             let sig=signature(&rows,&old);
@@ -142,11 +159,14 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
             if signature(&p.rows,&old)!=p.signature{return Err(conflict("远端配置已变化，请重新预览"));}
             if !skip_conflicts&&p.signature.iter().any(|(status,_)|*status==Status::Conflict){return Err(conflict("存在冲突，未写入；请重新预览或显式跳过冲突"));}
             let id=Uuid::new_v4().to_string();
-            let path=report_path(&state.report_dir,&id);
+            let path=report_path(&dir,&id);
+            let mut task=Task::new(id.clone());task.save(&dir).map_err(internal)?;
+            *state.progress.lock().map_err(internal)?=Some((key.into(),path.clone(),id.clone()));
             // Shared CLI implementation persists intent and stops on uncertain writes.
             let result=operations::execute(&s.api,&p.rows,&old,true,skip_conflicts,Some(path.clone()));
             let (code,message)=match result{Ok(c)=>(c,None),Err(e)=>(1,Some(format!("{e:#}")))};
-            if path.is_file(){s.reports.insert(id.clone(),code);}
+            *state.progress.lock().map_err(internal)?=None;
+            task.state=if code==0{"completed"}else{"failed"}.into();task.exit_code=Some(code);task.save(&dir).map_err(internal)?;
             let report=std::fs::read_to_string(&path).unwrap_or_default();
             let mut latest=BTreeMap::<String,String>::new();
             for line in report.lines(){
@@ -164,16 +184,17 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
             let rows=operations::snapshot(&s.api,&groups).map_err(upstream)?;
             let mut bytes=Vec::new();
             formats::write_to(&mut bytes,f,&rows).map_err(|e|bad(format!("{e:#}")))?;
-            let text=String::from_utf8(bytes).map_err(internal)?;
-            Ok(ok(json!({"filename":format!("tensuns-instances.{format}"),"content":text,"count":rows.len()})))
+            let (text,encoding)=if format=="xlsx"{(B64.encode(bytes),"base64")}else{(String::from_utf8(bytes).map_err(internal)?,"utf8")};
+            Ok(ok(json!({"filename":format!("tensuns-instances.{format}"),"content":text,"encoding":encoding,"count":rows.len()})))
         },
+        Action::Template=>{let row=Instance{id:"switch-01".into(),name:"snmp_exporter".into(),address:"192.0.2.11".into(),port:161,tags:vec![],meta:BTreeMap::new()};let content=B64.encode(crate::excel::write(&[row]).map_err(internal)?);Ok(ok(json!({"filename":"instances.xlsx","content":content,"encoding":"base64"})))},
         Action::Reports=>{
-            let reports=s.reports.iter().map(|(id,code)|json!({"id":id,"exit_code":code})).collect::<Vec<_>>();
+            let reports=workspace::tasks(&dir).map_err(internal)?;
             Ok(ok(json!({"reports":reports})))
         },
         Action::Report{id}=>{
-            if !s.reports.contains_key(&id){return Err(WebError(StatusCode::NOT_FOUND,"报告不属于当前会话".into()));}
-            let content=std::fs::read_to_string(report_path(&state.report_dir,&id)).map_err(internal)?;
+            if !workspace::valid_id(&id)||!workspace::tasks(&dir).map_err(internal)?.iter().any(|t|t.id==id){return Err(WebError(StatusCode::NOT_FOUND,"报告不属于当前连接".into()));}
+            let content=std::fs::read_to_string(report_path(&dir,&id)).map_err(internal)?;
             Ok(ok(json!({"filename":format!("import-{id}.jsonl"),"content":content})))
         },
         Action::Login{..}|Action::Logout=>unreachable!(),
@@ -189,10 +210,11 @@ pub fn serve(host:IpAddr,port:u16,base:String,user:String,timeout:u64,report_dir
     let addr=SocketAddr::new(host,port);
     let authority=addr.to_string();
     let origin=format!("http://{authority}");
-    let state=Arc::new(Shared{authority,origin:origin.clone(),base,user,timeout,report_dir,session:Mutex::new(None),gate:Arc::new(Semaphore::new(1))});
+    let profiles=Profiles::open(&report_dir,&base,&user)?;
+    let state=Arc::new(Shared{authority,origin:origin.clone(),base,user,timeout,report_dir,session:Mutex::new(None),gate:Arc::new(Semaphore::new(1)),profiles:Mutex::new(profiles),progress:Mutex::new(None)});
     // Keep a reference outside Tokio so the blocking reqwest runtime is dropped synchronously.
     let runtime=tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let app=Router::new().route("/",get(page)).route("/app.js",get(js)).route("/style.css",get(css)).route("/api/info",get(info)).route("/api/action",post(action))
+    let app=Router::new().route("/",get(page)).route("/app.js",get(js)).route("/style.css",get(css)).route("/api/info",get(info)).route("/api/progress",get(progress)).route("/api/action",post(action))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(state.clone(),guard)).with_state(state.clone());
     runtime.block_on(async move{

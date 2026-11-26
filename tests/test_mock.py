@@ -49,7 +49,7 @@ with tempfile.TemporaryDirectory() as d:
  run('new.txt','--apply','--report','again.jsonl');assert len(writes)==2;print('PASS legacy syntax / idempotence',flush=True)
  file('conflict.txt','new|old-0|192.0.2.1|9100||\nnew|new-3|192.0.2.1|9100||\n');run('import','conflict.txt','--report','conflict-plan.jsonl',rc=2);run('import','conflict.txt','--apply','--report','conflict.jsonl',rc=1);assert len(writes)==2
  run('import','conflict.txt','--apply','--skip-conflicts','--report','skip.jsonl');assert writes[-1]=='new-3';print('PASS conflict stop / skip',flush=True)
- for ext in ['json','jsonl','csv']:
+ for ext in ['json','jsonl','csv','xlsx']:
   run('export',f'out.{ext}','--service','special','--service','new');run('validate',f'out.{ext}');run('import',f'out.{ext}','--report',f'round-{ext}.jsonl');assert set(statuses(f'round-{ext}.jsonl'))=={'unchanged'};print('PASS roundtrip '+ext,flush=True)
  run('export','out.txt','--service','new');run('validate','out.txt');run('export','bad.txt','--service','special',rc=1);assert not pathlib.Path('bad.txt').exists();print('PASS TXT and refusal of lossy export',flush=True)
  run('export','out.txt','--service','new',rc=1);run('export','out.txt','--service','new','--force');print('PASS no-clobber / force',flush=True)

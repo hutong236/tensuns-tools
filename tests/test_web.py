@@ -76,9 +76,9 @@ with tempfile.TemporaryDirectory() as d:
   result=call('apply',ticket=plan['ticket'],confirm=True);assert result['exit_code']==0 and result['counts']=={'verified':2} and writes==['first','second']
   call('apply',409,ticket=plan['ticket'],confirm=True)
   reports=call('reports')['reports'];assert len(reports)==1
-  report=call('report',id=reports[0]['id']);assert 'verified' in report['content'];assert len(list(pathlib.Path(d).glob('*.jsonl')))==1
+  report=call('report',id=reports[0]['id']);assert 'verified' in report['content'];assert len(list(pathlib.Path(d).rglob('*.jsonl')))==1
   print('PASS preview, confirm, apply, verification, one-use ticket, report',flush=True)
-  for fmt in ['txt','csv','json','jsonl']:
+  for fmt in ['txt','csv','json','jsonl','xlsx']:
    exported=call('export',format=fmt,services=['new']);assert exported['count']==2
    plan=call('preview',format=fmt,content=exported['content']);assert plan['counts']=={'unchanged':2}
   print('PASS four-format export/import roundtrip',flush=True)
@@ -93,7 +93,7 @@ with tempfile.TemporaryDirectory() as d:
   fail_id='fail'
   plan=call('preview',format='txt',content='new|fail|192.0.2.1|9100||\nnew|never|192.0.2.1|9100||\n')
   result=call('apply',ticket=plan['ticket'],confirm=True);assert result['exit_code']==1 and result['counts']=={'failed_or_uncertain':1,'not_attempted':1} and 'never' not in writes
-  call('logout');call('groups',401);call('report',401,id=reports[0]['id'])
+  call('logout');call('groups',401);call('report',401,id=reports[0]['id']);token=call('login',username='admin',password='mock password')['session'];assert len(call('reports')['reports'])>=2;assert 'verified' in call('report',id=reports[0]['id'])['content'];assert call('template')['encoding']=='base64'
   print('PASS failed write stop and logout',flush=True)
  finally:
   p.terminate();p.wait(timeout=15)

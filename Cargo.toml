@@ -1,6 +1,6 @@
 [package]
 name = "tensuns-cli"
-version = "4.0.0"
+version = "4.1.0"
 edition = "2021"
 rust-version = "1.85"
 
@@ -22,6 +22,11 @@ zeroize = "1.8"
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros"] }
 uuid = { version = "1", features = ["v4"] }
+
+calamine = "0.26.1"
+rust_xlsxwriter = "0.79"
+base64 = "0.22"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"
