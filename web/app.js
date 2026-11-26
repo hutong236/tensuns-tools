@@ -1,6 +1,7 @@
 'use strict';
 const $=id=>document.getElementById(id);
 let profiles=[],activeProfile=null,progressTimer=null,snapshotList=[],diffResult=null,diffPage=1;
+let currentView='instances',importMode='batch';
 let session='',busy=false,groups=[],page=1,total=0,preview=null,previewPage=1,lastReport='';
 const statusNames={planned:'计划新增',unchanged:'配置一致',conflict:'配置冲突'};
 let messageTimer;
@@ -12,8 +13,25 @@ async function call(action){const headers={'Content-Type':'application/json'};if
  const raw=await r.text();let d;try{d=JSON.parse(raw)}catch{d={error:raw.slice(0,300)||'响应不是 JSON'}}
  if(r.status===401&&action.action!=='login'){reset();throw Error('会话已失效，请重新登录')}
  if(!r.ok)throw Error('HTTP '+r.status+'：'+(d.error||'操作失败'));return d}
-function reset(){session='';activeProfile=null;snapshotList=[];diffResult=null;$('diffResult').hidden=true;['snapshotsBody','diffBody','diffCounts','sourceSnapshot','targetSnapshot','snapshotGroups','diffGroups'].forEach(id=>$(id).replaceChildren());groups=[];page=1;total=0;preview=null;lastReport='';$('workspace').hidden=true;$('login').hidden=false;$('logout').hidden=true;$('connection').textContent='未连接';$('password').value='';$('importText').value='';$('importFile').value='';$('query').value='';$('singleName').value='';$('singleId').value='';$('singleAddress').value='';$('singleTags').value='[]';$('singleMeta').value='{}';['instancesBody','previewBody','reportsBody','exportGroups','group'].forEach(id=>$(id).replaceChildren());$('previewCard').hidden=true;$('resultCard').hidden=true;$('singleCard').hidden=true;$('groupCount').textContent='—';$('instanceCount').textContent='—';$('matchCount').textContent='—'}
-function show(view){document.querySelectorAll('.content>section').forEach(x=>x.hidden=x.id!=='view-'+view);document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.view===view))}
+function reset(){currentView='instances';importMode='batch';session='';activeProfile=null;snapshotList=[];diffResult=null;$('diffResult').hidden=true;['snapshotsBody','diffBody','diffCounts','sourceSnapshot','targetSnapshot','snapshotGroups','diffGroups'].forEach(id=>$(id).replaceChildren());groups=[];page=1;total=0;preview=null;lastReport='';$('workspace').hidden=true;$('login').hidden=false;$('logout').hidden=true;$('connection').textContent='未连接';$('password').value='';$('importText').value='';$('importFile').value='';$('query').value='';$('singleName').value='';$('singleId').value='';$('singleAddress').value='';$('singleTags').value='[]';$('singleMeta').value='{}';['instancesBody','previewBody','reportsBody','exportGroups','group'].forEach(id=>$(id).replaceChildren());$('previewCard').hidden=true;$('resultCard').hidden=true;$('singleCard').hidden=true;$('batchCard').hidden=false;$('groupCount').textContent='—';$('instanceCount').textContent='—';$('matchCount').textContent='—'}
+function show(view,mode='batch'){
+ // Every import entry starts a new UI flow. No stale preview, confirmation or result
+ // can carry from single-instance, batch or cross-environment sync to another flow.
+ if(currentView==='import'||view==='import'){
+  invalidate();lastReport='';$('resultCard').hidden=true;$('previewBody').replaceChildren();$('resultSummary').textContent='';
+ }
+ if(view==='import'){
+  importMode=mode;
+  $('batchCard').hidden=mode!=='batch';$('singleCard').hidden=mode!=='single';
+  $('importHeading').textContent=mode==='single'?'新增单个实例':mode==='sync'?'跨环境新增同步':'批量导入';
+  $('importDescription').textContent=mode==='single'?'填写单个实例配置，预览并确认后新增。':mode==='sync'?'检查同步来源、目标及导入计划。':'先校验并预览，明确确认后才写入 TenSunS。';
+  $('backFromImport').hidden=mode==='batch';
+  if(mode==='single')$('singleForm').reset();
+ }
+ currentView=view;
+ document.querySelectorAll('.content>section').forEach(x=>x.hidden=x.id!=='view-'+view);
+ document.querySelectorAll('.nav').forEach(x=>x.classList.toggle('active',x.dataset.view===(view==='import'&&mode==='single'?'instances':view==='import'&&mode==='sync'?'diff':view)))
+}
 function cell(tr,value,cls){const td=document.createElement('td');td.textContent=value==null?'':String(value);if(cls)td.className=cls;tr.append(td);return td}
 function row(body,values){const tr=document.createElement('tr');values.forEach(x=>cell(tr,x));body.append(tr);return tr}
 function download(filename,content,encoding){if(encoding==='base64')content=Uint8Array.from(atob(content),c=>c.charCodeAt(0));const u=URL.createObjectURL(new Blob([content],{type:'application/octet-stream'}));const a=document.createElement('a');a.href=u;a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),2000)}
@@ -29,7 +47,7 @@ function renderPreview(){const items=preview.entries;const size=50;const body=$(
 function showPreview(d,description=''){preview=d;previewPage=1;for(const [id,k] of [['planned','planned'],['unchanged','unchanged'],['conflicts','conflict']])$(id).textContent=preview.counts[k]||0;$('previewInfo').textContent=(description?description+' · ':'')+'共 '+preview.entries.length+' 条，预览有效期 10 分钟。执行前重新核对远端配置。';$('previewCard').hidden=false;renderPreview();updateApply();message('预览完成，尚未写入远端')}
 async function makePreview(format,content){invalidate();$('resultCard').hidden=true;showPreview(await call({action:'preview',format,content}))}
 async function loadReports(){const d=await call({action:'reports'});const body=$('reportsBody');body.replaceChildren();for(const x of d.reports){const tr=row(body,[x.id,dateText(x.created),x.state,x.source?.snapshot_id||'—',x.exit_code??'—']);const b=document.createElement('button');b.textContent='下载 JSONL';b.addEventListener('click',()=>task(async()=>{const r=await call({action:'report',id:x.id});download(r.filename,r.content)}));cell(tr,'').append(b)}if(!d.reports.length){const tr=row(body,['本会话暂无报告']);tr.firstChild.colSpan=6}}
-$('loginForm').addEventListener('submit',e=>{e.preventDefault();task(async()=>{let password=$('password').value;$('password').value='';try{const d=await call({action:'login',username:$('username').value,password,profile_id:$('profileSelect').value});session=d.session;activeProfile=d.profile}finally{password=''}$('login').hidden=true;$('workspace').hidden=false;$('logout').hidden=false;$('connection').textContent='已连接 · '+activeProfile.name;show('instances');await loadGroups();await loadInstances();message('TenSunS 登录成功')})});
+$('loginForm').addEventListener('submit',e=>{e.preventDefault();task(async()=>{let password=$('password').value;$('password').value='';try{const d=await call({action:'login',username:$('username').value.trim(),password,url:$('target').value.trim(),profile_id:$('profileSelect').value});session=d.session;activeProfile=d.profile}finally{password=''}$('login').hidden=true;$('workspace').hidden=false;$('logout').hidden=false;$('connection').textContent='已连接 · '+activeProfile.name;show('instances');await loadProfiles(activeProfile.id);await loadGroups();await loadInstances();message('TenSunS 登录成功')})});
 $('logout').addEventListener('click',()=>task(async()=>{try{await call({action:'logout'})}finally{reset()}}));
 document.querySelectorAll('.nav').forEach(e=>e.addEventListener('click',()=>task(async()=>{show(e.dataset.view);if(e.dataset.view==='reports')await loadReports();if(e.dataset.view==='profiles')await loadProfiles();if(['snapshots','diff'].includes(e.dataset.view))await loadSnapshots()})));
 $('refresh').onclick=()=>task(async()=>{page=1;await loadGroups();await loadInstances()});
@@ -37,7 +55,8 @@ $('searchForm').onsubmit=e=>{e.preventDefault();task(async()=>{page=1;await load
 $('group').onchange=$('pageSize').onchange=()=>task(async()=>{page=1;await loadInstances()});
 $('previous').onclick=()=>task(async()=>{if(page>1)page--;await loadInstances()});
 $('next').onclick=()=>task(async()=>{if(page*Number($('pageSize').value)<total)page++;await loadInstances()});
-$('addOne').onclick=()=>{show('import');invalidate();$('singleCard').hidden=false;$('singleName').value=$('group').value;$('singleId').focus()};
+$('addOne').onclick=()=>{if(busy)return;show('import','single');$('singleName').value=$('group').value;$('singleId').focus()};
+$('backFromImport').onclick=()=>{if(!busy)show(importMode==='sync'?'diff':'instances')};
 $('importFile').onchange=()=>{invalidate();const f=$('importFile').files[0];if(f){const ext=f.name.split('.').pop().toLowerCase();if(['txt','csv','json','jsonl','xlsx'].includes(ext))$('importFormat').value=ext}};
 $('importText').oninput=$('importFormat').onchange=invalidate;
 $('singleForm').addEventListener('input',invalidate);
@@ -54,9 +73,10 @@ $('selectAll').onclick=()=>{$('exportGroups').querySelectorAll('input').forEach(
 $('clearSelection').onclick=()=>{$('exportGroups').querySelectorAll('input').forEach(x=>x.checked=false)};
 $('exportForm').onsubmit=e=>{e.preventDefault();task(async()=>{const services=Array.from($('exportGroups').querySelectorAll('input:checked'),x=>x.value);const d=await call({action:'export',format:$('exportFormat').value,services});download(d.filename,d.content,d.encoding);message('已导出 '+d.count+' 条实例')})};
 $('reportRefresh').onclick=()=>task(loadReports);
-async function loadProfiles(){const r=await fetch('/api/info',{cache:'no-store'});if(!r.ok)throw Error('无法读取连接配置');const d=await r.json();profiles=d.profiles;const sel=$('profileSelect'),old=sel.value;sel.replaceChildren(...profiles.map(p=>new Option(p.name,p.id)));sel.value=profiles.some(p=>p.id===old)?old:d.default_id;renderProfile();$('version').textContent='V'+d.version;$('profilesBody').replaceChildren();for(const p of profiles)row($('profilesBody'),[p.name,p.url,p.username])}
-function renderProfile(){const p=profiles.find(p=>p.id===$('profileSelect').value);if(p){$('target').textContent=p.url;$('username').value=p.username;$('password').value=''}}
+async function loadProfiles(preferred){const r=await fetch('/api/info',{cache:'no-store'});if(!r.ok)throw Error('无法读取连接配置');const d=await r.json();profiles=d.profiles;const sel=$('profileSelect'),old=preferred||sel.value;sel.replaceChildren(...profiles.map(p=>new Option(p.name+' · '+p.url,p.id)));sel.value=profiles.some(p=>p.id===old)?old:d.default_id;renderProfile();$('version').textContent='V'+d.version;$('profilesBody').replaceChildren();for(const p of profiles)row($('profilesBody'),[p.name,p.url,p.username])}
+function renderProfile(){const p=profiles.find(p=>p.id===$('profileSelect').value);if(p){$('target').value=p.url;$('username').value=p.username;$('password').value=''}}
 $('profileSelect').onchange=renderProfile;
+$('target').oninput=$('username').oninput=()=>{$('password').value=''};
 $('profileForm').onsubmit=e=>{e.preventDefault();task(async()=>{await call({action:'add_profile',name:$('profileName').value,url:$('profileUrl').value,username:$('profileUser').value});e.target.reset();await loadProfiles();message('连接已保存，退出后可切换')})};
 function dateText(n){return new Date(n*1000).toLocaleString()}
 function snapshotRef(value){if(!value)return null;const x=snapshotList.find(s=>s.id===value);if(!x)throw Error('快照不存在，请刷新');return {profile_id:x.profile_id,snapshot_id:x.id}}
@@ -86,5 +106,5 @@ function renderDiff(){
 }
 $('diffForm').onsubmit=e=>{e.preventDefault();task(async()=>{const source=snapshotRef($('sourceSnapshot').value);if(!source)throw Error('请选择来源快照');diffResult=await call({action:'compare',source,target:snapshotRef($('targetSnapshot').value),services:selected('diffGroups')});diffPage=1;$('diffFilter').value='';$('diffCounts').replaceChildren();for(const [k,v] of Object.entries(diffNames)){const box=document.createElement('div'),label=document.createElement('small'),n=document.createElement('strong');label.textContent=v;n.textContent=diffResult.counts[k]||0;box.append(label,n);$('diffCounts').append(box)}$('diffResult').hidden=false;renderDiff();message('差异比较完成，未写入远端')})};
 $('diffFilter').onchange=()=>{diffPage=1;renderDiff()};$('diffPrev').onclick=()=>{if(diffPage>1)diffPage--;renderDiff()};$('diffNext').onclick=()=>{diffPage++;renderDiff()};$('downloadDiff').onclick=()=>{if(diffResult)download('tensuns-diff.json',JSON.stringify(diffResult,null,2))};
-$('syncPreview').onclick=()=>task(async()=>{if($('targetSnapshot').value)throw Error('新增同步仅能写入当前连接，比较目标请选择当前连接');const source=snapshotRef($('sourceSnapshot').value);if(!source)throw Error('请选择来源快照');const label=snapshotTitle(snapshotList.find(s=>s.id===source.snapshot_id));invalidate();$('resultCard').hidden=true;const d=await call({action:'sync_preview',source,services:selected('diffGroups')});show('import');$('singleCard').hidden=true;showPreview(d,'来源：'+label+' → 当前目标：'+activeProfile.name+' ('+activeProfile.url+')')});
-loadProfiles().catch(e=>message(e.message,true));
+$('syncPreview').onclick=()=>task(async()=>{if($('targetSnapshot').value)throw Error('新增同步仅能写入当前连接，比较目标请选择当前连接');const source=snapshotRef($('sourceSnapshot').value);if(!source)throw Error('请选择来源快照');const label=snapshotTitle(snapshotList.find(s=>s.id===source.snapshot_id));invalidate();$('resultCard').hidden=true;const d=await call({action:'sync_preview',source,services:selected('diffGroups')});show('import','sync');showPreview(d,'来源：'+label+' → 当前目标：'+activeProfile.name+' ('+activeProfile.url+')')});
+loadProfiles().catch(e=>{message(e.message,true);$('target').placeholder='请输入 TenSunS Web URL'});

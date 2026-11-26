@@ -36,7 +36,7 @@ struct Shared{
 #[derive(Deserialize)]
 #[serde(tag="action",rename_all="snake_case",deny_unknown_fields)]
 enum Action{
-    Login{username:String,password:String,#[serde(default)]profile_id:Option<String>},
+    Login{username:String,password:String,#[serde(default)]profile_id:Option<String>,#[serde(default)]url:Option<String>},
     AddProfile{name:String,url:String,username:String},
     Logout,
     Groups,
@@ -110,13 +110,35 @@ fn dispatch(state:&Shared,key:&str,action:Action)->WebResult{
     let mut slot=state.session.lock().map_err(internal)?;
     if slot.as_ref().is_some_and(|s|s.started.elapsed()>=Duration::from_secs(3600)){*slot=None;}
     let action=match action{
-        Action::Login{username,password,profile_id}=>{
+        Action::Login{username,password,profile_id,url}=>{
             let mut password=zeroize::Zeroizing::new(password);
             if username.trim().is_empty()||password.is_empty()||username.len()>256||password.len()>4096{return Err(bad("用户名或密码无效"));}
-            let profile=state.profiles.lock().map_err(internal)?.get(profile_id.as_deref()).map_err(|e|bad(e.to_string()))?;
-            if username.trim()!=profile.username{return Err(bad("用户名需与连接配置一致"));}
-            let api=Api::login_web(&profile.url,username.trim(),state.timeout,std::mem::take(&mut *password)).map_err(|_|unauthorized())?;
+            // An explicit URL selects a connection by URL + username, never rebinds a
+            // saved profile ID (its existing snapshots/reports must keep their origin).
+            let (url,existing)={
+                let profiles=state.profiles.lock().map_err(internal)?;
+                if let Some(url)=url{
+                    let url=workspace::validate_url(url.trim()).map_err(|e|bad(e.to_string()))?;
+                    let existing=profiles.items.iter().find(|p|p.url==url&&p.username==username.trim()).cloned();
+                    if existing.is_none()&&profiles.items.len()>=100{return Err(bad("最多保存 100 个连接"));}
+                    (url,existing)
+                }else{
+                    let p=profiles.get(profile_id.as_deref()).map_err(|e|bad(e.to_string()))?;
+                    if username.trim()!=p.username{return Err(bad("用户名需与连接配置一致，或显式提供 URL"));}
+                    (p.url.clone(),Some(p))
+                }
+            };
+            let api=Api::login_web(&url,username.trim(),state.timeout,std::mem::take(&mut *password)).map_err(|_|unauthorized())?;
             api.groups().map_err(upstream)?;
+            // Persist a new profile only after successful authentication and catalog access.
+            let profile=match existing{
+                Some(p)=>p,
+                None=>{
+                    let mut profiles=state.profiles.lock().map_err(internal)?;
+                    let name=format!("TenSunS {}",profiles.items.len()+1);
+                    profiles.add(name,url,username.trim().to_owned()).map_err(internal)?
+                }
+            };
             let token=Uuid::new_v4().to_string();
             *slot=Some(Session{key:token.clone(),api,started:Instant::now(),preview:None,profile_id:profile.id.clone()});
             return Ok(ok(json!({"session":token,"expires_in":3600,"profile":profile})));

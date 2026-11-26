@@ -72,6 +72,16 @@ jobs:
         run: python tests/test_mock.py target/${{ matrix.target }}/release/${{ matrix.binary }}
       - name: Web API integration tests
         run: python tests/test_web.py target/${{ matrix.target }}/release/${{ matrix.binary }}
+      - name: Install Chromium browser test dependencies
+        if: matrix.arch == 'linux-amd64'
+        run: |
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Real browser regression tests
+        if: matrix.arch == 'linux-amd64'
+        env:
+          TENSUNS_BROWSER_TEST: '1'
+        run: python tests/test_web.py target/${{ matrix.target }}/release/${{ matrix.binary }}
       - name: Package and checksum
         env:
           BUILD_TARGET: ${{ matrix.target }}

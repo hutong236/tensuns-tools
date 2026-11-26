@@ -1,3 +1,3 @@
-# V4.2 验收状态
+# V4.2.1 验收状态
 
-V4.2 新增配置快照、字段级 Diff、跨环境仅新增同步及 CLI diff。V4.1 与 V4.2 编译和模拟回归测试以各自 GitHub Actions 为准；尚未在真实 TenSunS 环境或实际浏览器验收。无签名、公证或完全静态链接保证。
+修复登录页 URL 和新增/批量导入页面隔离，新增 API 与 Chromium 回归测试。编译及测试以本次 GitHub Actions 为准；尚未在真实 TenSunS 环境验收。
