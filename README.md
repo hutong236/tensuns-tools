@@ -1,4 +1,4 @@
-# TenSunS CLI V3.0.0
+# TenSunS CLI V4.0.0
 
 Rust 重构版，通过 TenSunS Web API 批量管理自定义实例。运行无需 Bash、curl、jq 或 Python；Python 仅用于 CI 集成测试及打包。
 
@@ -13,6 +13,18 @@ cargo test --all-targets
 python3 tests/test_mock.py target/release/tensuns
 ```
 Windows 可执行文件为 target/release/tensuns.exe。首次构建生成 Cargo.lock；建议将生成并审核的锁文件提交。CI 在未提交锁文件时先生成一次，并让所有平台共用此锁文件。Rust 1.85 为源码最低目标，未锁定依赖可能要求更高版本。
+
+## Web 控制台（V4.0）
+
+```bash
+tensuns --url https://tensuns.example.com serve --host 127.0.0.1 --port 8080
+```
+
+打开终端打印的 URL。默认仅允许 loopback 地址，不提供公网/局域网服务模式。Web 通过启动时指定的 TenSunS URL 认证，登录用户名和密码由浏览器输入，不使用 CLI 的 TENSUNS_TOKEN；若要切换后端，请退出并以不同 URL 启动进程。登录后支持服务组、实例搜索与分页、单条新增、四格式文件导入预览、冲突策略、明确确认后执行及回读、全量/指定服务组导出、任务报告下载。前端 HTML/CSS/JS 嵌入同一 Rust 可执行文件，无 Node.js、CDN 或外置资源。
+
+Web 每个进程仅一个本地活动会话，登录成功可替换旧会话。会话凭据只在浏览器 JS 内存与服务端内存，刷新页面需重新登录，登出清理。会话有效期 1 小时；预览有效期 10 分钟。所有 API POST 检查 Origin、Host、JSON 类型与会话头（登录除外），不启用 CORS。浏览器连接本地 HTTP，后端建议 HTTPS。批量导入最大 16 MiB HTTP 请求、10000 条实例；每次操作串行执行，应用前重新获取全量配置及比较预览计划，写入不重试。报告保存在 --report-dir（默认 tensuns-web-reports），下载为 JSONL。服务端启动时固定报告目录；请使用用户独占的本地目录。大批量请求可能需要较长时间，页面显示执行状态，勿重复提交。报告不保证能恢复完整 Consul 配置。
+
+尚未实现多连接持久化、多人共享、RBAC、Excel XLSX、后台任务恢复、跨环境同步、批量更新删除、健康检查完整恢复、Docker/Helm。请勿通过反向代理暴露此本地控制台。
 
 ## 连接设置
 
@@ -55,11 +67,11 @@ TXT 六列：ServiceName|InstanceID|IP|Port|Tags|Meta，Tags 逗号分隔，Meta
 
 ## GitHub Actions
 
-main push、PR、手动运行及 v* tag 触发编译。Linux x64/ARM64、macOS Intel/Apple Silicon、Windows x64 各自原生 runner 执行 Rust 单测、release build、6001 实例模拟 API 集成测试，然后打包上传。所有平台通过后才允许 tag 发布。版本标签必须与 Cargo.toml 一致，例如 v3.0.0。
+main push、PR、手动运行及 v* tag 触发编译。Linux x64/ARM64、macOS Intel/Apple Silicon、Windows x64 各自原生 runner 执行 Rust 单测、release build、6001 实例模拟 API 集成测试，然后打包上传。所有平台通过后才允许 tag 发布。版本标签必须与 Cargo.toml 一致，例如 v4.0.0。
 
 ```bash
-git tag v3.0.0
-git push origin v3.0.0
+git tag v4.0.0
+git push origin v4.0.0
 ```
 
 首次 CI 结果以 Actions 为准；尚未在真实 TenSunS 环境联调。编译依赖、runner 可用性、实际系统兼容性需经 CI 和目标环境验证。

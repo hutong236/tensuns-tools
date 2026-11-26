@@ -4,9 +4,9 @@ use serde_json::json;
 use std::{collections::{BTreeMap, BTreeSet, HashMap}, fs::{File,OpenOptions}, io::Write, path::{Path,PathBuf}, thread, time::{Duration,SystemTime,UNIX_EPOCH}};
 
 #[derive(Debug,PartialEq,Eq,Clone,Copy)]
-enum Status { Planned, Unchanged, Conflict }
-impl Status {fn as_str(self)->&'static str{match self{Self::Planned=>"planned",Self::Unchanged=>"unchanged",Self::Conflict=>"conflict"}}}
-fn plan<'a>(wanted:&'a [Instance], old:&[Instance])->Vec<(&'a Instance,Status,Vec<String>)> {
+pub(crate) enum Status { Planned, Unchanged, Conflict }
+impl Status {pub(crate) fn as_str(self)->&'static str{match self{Self::Planned=>"planned",Self::Unchanged=>"unchanged",Self::Conflict=>"conflict"}}}
+pub(crate) fn plan<'a>(wanted:&'a [Instance], old:&[Instance])->Vec<(&'a Instance,Status,Vec<String>)> {
     let mut index:HashMap<&str,Vec<&Instance>>=HashMap::new();
     for r in old{index.entry(&r.id).or_default().push(r);}
     wanted.iter().map(|r|{
@@ -40,7 +40,10 @@ fn create_report(path:&Path)->Result<File> {
 pub fn import(api:&Api,wanted:&[Instance],apply:bool,skip_conflicts:bool,report:Option<PathBuf>)->Result<i32>{
     let groups=api.groups()?;
     let old=snapshot(api,&groups).context("catalog query failed; no writes")?;
-    let items=plan(wanted,&old);
+    execute(api,wanted,&old,apply,skip_conflicts,report)
+}
+pub(crate) fn execute(api:&Api,wanted:&[Instance],old:&[Instance],apply:bool,skip_conflicts:bool,report:Option<PathBuf>)->Result<i32>{
+    let items=plan(wanted,old);
     let report=report.unwrap_or_else(||PathBuf::from(format!("import-report-{}-{}.jsonl",SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),std::process::id())));
     let mut log=create_report(&report)?;
     let (mut planned,mut unchanged,mut conflicts)=(0,0,0);

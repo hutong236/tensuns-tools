@@ -4,3 +4,5 @@ import-report-*.jsonl
 /dist/
 .env
 .env.*
+
+/tensuns-web-reports/

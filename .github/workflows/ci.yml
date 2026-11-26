@@ -70,6 +70,8 @@ jobs:
         run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Mock API integration tests
         run: python tests/test_mock.py target/${{ matrix.target }}/release/${{ matrix.binary }}
+      - name: Web API integration tests
+        run: python tests/test_web.py target/${{ matrix.target }}/release/${{ matrix.binary }}
       - name: Package and checksum
         env:
           BUILD_TARGET: ${{ matrix.target }}

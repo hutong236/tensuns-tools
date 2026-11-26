@@ -32,10 +32,13 @@ fn from_fields(f: &[&str], csv: bool) -> Result<Instance> {
 }
 pub fn read(path: &Path, format: Format) -> Result<Vec<Instance>> {
     let file = File::open(path).with_context(|| format!("open {}",path.display()))?;
+    read_from(BufReader::new(file),format)
+}
+pub(crate) fn read_from<R: BufRead>(file:R, format:Format)->Result<Vec<Instance>> {
     let mut rows = Vec::new();
     match format {
-        Format::Json => { rows = serde_json::from_reader(BufReader::new(file))?; }
-        Format::Jsonl | Format::Txt => for (i,line) in BufReader::new(file).lines().enumerate() {
+        Format::Json => { rows = serde_json::from_reader(file)?; }
+        Format::Jsonl | Format::Txt => for (i,line) in file.lines().enumerate() {
             let line = line?;
             let line = if i==0 {line.trim_start_matches('\u{feff}')} else {&line};
             if line.trim().is_empty() || (matches!(format,Format::Txt) && line.trim_start().starts_with('#')) {continue;}
@@ -63,14 +66,18 @@ pub fn write(path: &Path, format: Format, rows: &[Instance], force: bool) -> Res
     if let Ok(m)=std::fs::symlink_metadata(path) { ensure!(!m.file_type().is_symlink() && m.is_file() && force,"refusing existing output (use --force for regular files): {}",path.display()); }
     let parent=path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut tmp=NamedTempFile::new_in(parent)?;
+    write_to(&mut tmp,format,rows)?;
+    tmp.as_file().sync_all()?;
+    if force {tmp.persist(path)?;} else {tmp.persist_noclobber(path)?;}
+    Ok(())
+}
+pub(crate) fn write_to<W: Write>(mut tmp: W, format:Format, rows:&[Instance])->Result<()> {
     match format {
         Format::Json => {serde_json::to_writer_pretty(&mut tmp,rows)?; writeln!(tmp)?;},
         Format::Jsonl => for r in rows {serde_json::to_writer(&mut tmp,r)?;writeln!(tmp)?;},
         Format::Txt => {writeln!(tmp,"# ServiceName|InstanceID|IP|Port|Tags|Meta")?;for r in rows {writeln!(tmp,"{}",txt_line(r)?)?;}},
         Format::Csv => {let mut w=csv::Writer::from_writer(&mut tmp); w.write_record(HEADER)?; for r in rows {w.write_record([r.name.clone(),r.id.clone(),r.address.clone(),r.port.to_string(),serde_json::to_string(&r.tags)?,serde_json::to_string(&r.meta)?])?;}w.flush()?;},
     }
-    tmp.as_file().sync_all()?;
-    if force {tmp.persist(path)?;} else {tmp.persist_noclobber(path)?;}
     Ok(())
 }
 #[cfg(test)]

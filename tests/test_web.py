@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Web integration test: real local binary, isolated mock upstream, no external services."""
+import json, os, pathlib, socket, subprocess, sys, tempfile, threading, time, urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+binary=pathlib.Path(sys.argv[1]).resolve()
+def row(i,g='bulk'):return dict(ID=i,name=g,address='192.0.2.1',port=9100,tags=[],meta={})
+state={f'old-{i}':row(f'old-{i}') for i in range(6001)}
+writes=[]
+fail_id=None
+class Upstream(BaseHTTPRequestHandler):
+ def log_message(self,*a):pass
+ def send(self,d,s=200):
+  b=json.dumps(d,ensure_ascii=False).encode();self.send_response(s);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(b)));self.end_headers();self.wfile.write(b)
+ def do_GET(self):
+  if self.headers.get('Content-Type'):return self.send({'error':'unexpected Content-Type'},400)
+  if self.headers.get('Authorization')!='Bearer mock':return self.send({'code':50000})
+  u=urlparse(self.path)
+  if u.path=='/api/consul/services_name':return self.send({'code':20000,'services_name':sorted({r['name'] for r in state.values()})})
+  if u.path=='/api/consul/instances':
+   g=parse_qs(u.query)['service_name'][0]
+   return self.send({'code':20000,'instances':[dict(r,tags=r['tags'] or '无',meta=[r['meta']] if r['meta'] else '无') for r in state.values() if r['name']==g]})
+  return self.send({},404)
+ def do_POST(self):
+  data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  if self.path=='/api/user/login':
+   return self.send({'code':20000,'data':{'token':'Bearer mock'}} if data=={'username':'admin','password':'mock password'} else {'code':40000})
+  assert self.path=='/api/consul/sid' and self.headers.get('Authorization')=='Bearer mock'
+  d=data['instance_dict'];writes.append(d['ID'])
+  if d['ID']==fail_id:return self.send({'code':50000,'data':'mock failure'})
+  assert d['checkInfo']['isCheck'] is False
+  state[d['ID']]=dict(ID=d['ID'],name=d['name'],address=d['address'],port=d['port'],tags=d['tags'],meta=json.loads(d['metaInfo']['metaJson']) if d['metaInfo']['isMeta'] else {})
+  return self.send({'code':20000})
+up=ThreadingHTTPServer(('127.0.0.1',0),Upstream);threading.Thread(target=up.serve_forever,daemon=True).start()
+with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+origin=f'http://127.0.0.1:{port}'
+opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with tempfile.TemporaryDirectory() as d:
+ env=dict(os.environ,NO_PROXY='127.0.0.1,localhost',TENSUNS_TOKEN='must-not-use-in-web')
+ p=subprocess.Popen([str(binary),'--url',f'http://127.0.0.1:{up.server_port}','serve','--port',str(port),'--report-dir',d],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,env=env)
+ token=''
+ def req(path,body=None,expected=200,headers=None,auth=True):
+  h=dict(headers or {})
+  if body is not None:h.setdefault('Content-Type','application/json');h.setdefault('Origin',origin)
+  if token and auth:h['X-TenSunS-Session']=token
+  q=urllib.request.Request(origin+path,data=None if body is None else json.dumps(body).encode(),headers=h)
+  try:
+   with opener.open(q,timeout=30) as r:status=r.status;data=r.read();rh=r.headers
+  except urllib.error.HTTPError as e:status=e.code;data=e.read();rh=e.headers
+  assert status==expected,(path,body and body.get('action'),status,expected,data[:300])
+  return data,rh
+ def call(action,expected=200,**kw):
+  return json.loads(req('/api/action',dict(action=action,**kw),expected)[0])
+ try:
+  for _ in range(100):
+   try:req('/api/info');break
+   except OSError:
+    if p.poll() is not None:raise RuntimeError('Web server exited')
+    time.sleep(.1)
+  else:raise RuntimeError('Web server not ready')
+  html,h=req('/');assert b'TenSunS Tools' in html and 'frame-ancestors' in h['Content-Security-Policy']
+  assert b'fetch(' in req('/app.js')[0];req('/style.css')
+  req('/api/info',expected=403,headers={'Host':'evil.example'})
+  req('/api/action',{'action':'login','username':'admin','password':'mock password'},403,{'Origin':'https://evil.example'})
+  call('groups',401)
+  call('login',401,username='admin',password='wrong')
+  token=call('login',username='admin',password='mock password')['session']
+  req('/api/action',{'action':'groups'},401,auth=False)
+  assert call('groups')['groups']==[{'name':'bulk','count':6001}]
+  result=call('instances',service='bulk',query='old-1',page=1,page_size=20);assert len(result['rows'])==20 and result['total']>20
+  print('PASS Web assets, Host/Origin, auth, large catalog, pagination',flush=True)
+  data='new|first|192.0.2.1|9100||\nnew|second|192.0.2.1|9100|test|env=prod\n'
+  plan=call('preview',format='txt',content=data);assert plan['counts']=={'planned':2} and not writes
+  call('apply',400,ticket=plan['ticket'],confirm=False)
+  result=call('apply',ticket=plan['ticket'],confirm=True);assert result['exit_code']==0 and result['counts']=={'verified':2} and writes==['first','second']
+  call('apply',409,ticket=plan['ticket'],confirm=True)
+  reports=call('reports')['reports'];assert len(reports)==1
+  report=call('report',id=reports[0]['id']);assert 'verified' in report['content'];assert len(list(pathlib.Path(d).glob('*.jsonl')))==1
+  print('PASS preview, confirm, apply, verification, one-use ticket, report',flush=True)
+  for fmt in ['txt','csv','json','jsonl']:
+   exported=call('export',format=fmt,services=['new']);assert exported['count']==2
+   plan=call('preview',format=fmt,content=exported['content']);assert plan['counts']=={'unchanged':2}
+  print('PASS four-format export/import roundtrip',flush=True)
+  plan=call('preview',format='txt',content='new|third|192.0.2.1|9100||\n')
+  state['third']=row('third','other');call('apply',409,ticket=plan['ticket'],confirm=True);assert 'third' not in writes
+  plan=call('preview',format='txt',content='new|third|192.0.2.1|9100||\nnew|fourth|192.0.2.1|9100||\n');assert plan['counts']=={'conflict':1,'planned':1}
+  call('apply',409,ticket=plan['ticket'],confirm=True);assert 'fourth' not in writes
+  plan=call('preview',format='txt',content='new|third|192.0.2.1|9100||\nnew|fourth|192.0.2.1|9100||\n')
+  assert call('apply',ticket=plan['ticket'],confirm=True,skip_conflicts=True)['exit_code']==0
+  assert writes[-1]=='fourth'
+  print('PASS stale plan and cross-service conflicts',flush=True)
+  fail_id='fail'
+  plan=call('preview',format='txt',content='new|fail|192.0.2.1|9100||\nnew|never|192.0.2.1|9100||\n')
+  result=call('apply',ticket=plan['ticket'],confirm=True);assert result['exit_code']==1 and result['counts']=={'failed_or_uncertain':1,'not_attempted':1} and 'never' not in writes
+  call('logout');call('groups',401);call('report',401,id=reports[0]['id'])
+  print('PASS failed write stop and logout',flush=True)
+ finally:
+  p.terminate();p.wait(timeout=15)
+up.shutdown()

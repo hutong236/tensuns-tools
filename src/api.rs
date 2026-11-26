@@ -8,6 +8,12 @@ use zeroize::Zeroize;
 pub struct Api { client: Client, base: String, auth: HeaderValue }
 impl Api {
     pub fn login(base: &str, user: &str, timeout: u64) -> Result<Self> {
+        Self::connect(base,user,timeout,None)
+    }
+    pub fn login_web(base: &str, user: &str, timeout: u64, password: String) -> Result<Self> {
+        Self::connect(base,user,timeout,Some(zeroize::Zeroizing::new(password)))
+    }
+    fn connect(base: &str, user: &str, timeout: u64, supplied: Option<zeroize::Zeroizing<String>>) -> Result<Self> {
         let url = Url::parse(base)?;
         ensure!(matches!(url.scheme(),"http"|"https") && url.host_str().is_some() && url.username().is_empty() && url.password().is_none() && url.query().is_none(),"invalid Web base URL");
         let mut url=url; url.set_fragment(None);
@@ -16,10 +22,11 @@ impl Api {
         if url.scheme()=="http" {eprintln!("[WARN] HTTP transmits credentials in cleartext; HTTPS recommended");}
         ensure!(timeout>0,"timeout must be positive");
         let client=Client::builder().timeout(Duration::from_secs(timeout)).connect_timeout(Duration::from_secs(5)).redirect(Policy::none()).build()?;
-        let mut token=match std::env::var("TENSUNS_TOKEN") {Ok(s) if !s.is_empty()=>s,_=>{
+        let env_token=if supplied.is_none(){std::env::var("TENSUNS_TOKEN").ok()}else{None};
+        let mut token=match env_token {Some(s) if !s.is_empty()=>s,_=>{
             eprintln!("[INFO] Login: {base} / {user}");
-            let mut password=if io::stdin().is_terminal(){rpassword::prompt_password("TenSunS Password: ")?}else{let mut s=String::new();io::stdin().read_line(&mut s)?;s.trim_end_matches(['\r','\n']).to_owned()};
-            let request=client.post(format!("{base}/api/user/login")).header(ACCEPT,"application/json").json(&json!({"username":user,"password":password}));
+            let mut password=match supplied { Some(p)=>p, None=>zeroize::Zeroizing::new(if io::stdin().is_terminal(){rpassword::prompt_password("TenSunS Password: ")?}else{let mut s=String::new();io::stdin().read_line(&mut s)?;s.trim_end_matches(['\r','\n']).to_owned()}) };
+            let request=client.post(format!("{base}/api/user/login")).header(ACCEPT,"application/json").json(&json!({"username":user,"password":password.as_str()}));
             password.zeroize();
             let mut response=send(request,"login",false)?;
             let tok=response.pointer_mut("/data/token").and_then(|v|v.as_str().map(str::to_owned)).context("missing login token")?;
