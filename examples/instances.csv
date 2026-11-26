@@ -1,0 +1,4 @@
+ServiceName,InstanceID,IP,Port,Tags,Meta
+snmp_exporter,switch-01,192.0.2.11,161,[],"{""vendor"":""huawei"",""env"":""prod""}"
+snmp_exporter,switch-02,192.0.2.12,161,[],"{""vendor"":""cisco"",""env"":""prod""}"
+custom_exporter,storage-01,192.0.2.21,9100,[],{}

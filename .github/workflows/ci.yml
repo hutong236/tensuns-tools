@@ -1,0 +1,113 @@
+name: CI and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: '1'
+jobs:
+  lock:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve dependencies once for all platforms
+        shell: bash
+        run: |
+          if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+  build:
+    needs: lock
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: linux-amd64
+            binary: tensuns
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: linux-arm64
+            binary: tensuns
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: macos-amd64
+            binary: tensuns
+          - os: macos-15
+            target: aarch64-apple-darwin
+            arch: macos-arm64
+            binary: tensuns
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            arch: windows-amd64
+            binary: tensuns.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cargo-lock
+          path: .
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests
+        run: cargo test --locked --all-targets --target ${{ matrix.target }}
+      - name: Release build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Mock API integration tests
+        run: python tests/test_mock.py target/${{ matrix.target }}/release/${{ matrix.binary }}
+      - name: Package and checksum
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_ARCH: ${{ matrix.arch }}
+          BUILD_BINARY: ${{ matrix.binary }}
+        run: python scripts/package.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tensuns-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tensuns-*
+          path: release-assets
+          merge-multiple: true
+      - name: Verify version and all packages
+        shell: bash
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          test "$GITHUB_REF_NAME" = "v$version"
+          cd release-assets
+          test "$(find . -name '*.sha256' | wc -l)" -eq 5
+          sha256sum -c *.sha256
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --generate-notes --title "TenSunS CLI $GITHUB_REF_NAME"
